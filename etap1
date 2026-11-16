@@ -1,0 +1,143 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#define ERR(source) \
+    (perror(source), exit(EXIT_FAILURE))
+
+#define RECIPE_SIZE 2048
+#define LINE_SIZE 64
+
+void write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+        {
+            written += (size_t)n;
+        }
+        else if (n == -1 && errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+
+            ERR("write");
+        }
+    }
+}
+
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        char recipe[RECIPE_SIZE];
+        memset(recipe, ' ', sizeof(recipe));
+
+        for (int i = LINE_SIZE - 1; i < RECIPE_SIZE; i += LINE_SIZE)
+            recipe[i] = '\n';
+
+        write_all(fd, recipe, sizeof(recipe));
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open");
+
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open");
+
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        fprintf(stderr, "Ta ksiega to nie przepis!\n");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    return fd;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3)
+    {
+        fprintf(stderr, "Usage: %s recipe tower1\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    int recipe_fd = open_recipe(argv[1]);
+
+    struct stat st;
+
+    if (stat(argv[2], &st) == -1 || !S_ISFIFO(st.st_mode))
+    {
+        fprintf(stderr, "Nie ma babci na wiezy %s\n", argv[2]);
+        close(recipe_fd);
+        return EXIT_FAILURE;
+    }
+
+    int fifo_fd = open(argv[2], O_RDONLY);
+
+    if (fifo_fd == -1)
+    {
+        fprintf(stderr, "Nie ma babci na wiezy %s\n", argv[2]);
+        close(recipe_fd);
+        return EXIT_FAILURE;
+    }
+
+    char buf[256];
+
+    while (1)
+    {
+        ssize_t n = read(fifo_fd, buf, sizeof(buf));
+
+        if (n > 0)
+        {
+            write_all(STDOUT_FILENO, buf, (size_t)n);
+        }
+        else if (n == 0)
+        {
+            break;
+        }
+        else if (errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            ERR("read");
+        }
+    }
+
+    if (close(fifo_fd) == -1)
+        ERR("close");
+
+    if (close(recipe_fd) == -1)
+        ERR("close");
+
+    return EXIT_SUCCESS;
+}
