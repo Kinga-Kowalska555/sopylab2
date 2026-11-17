@@ -1,0 +1,33 @@
+int flags = fcntl(fd, F_GETFL);  // pobierz aktualne flagi
+if (flags == -1)
+    ERR("fcntl");
+
+flags |= O_NONBLOCK;             // dodaj flagę
+
+if (fcntl(fd, F_SETFL, flags) == -1)
+    ERR("fcntl");
+
+    
+
+
+    int flags = fcntl(fd, F_GETFL);
+if (flags == -1)
+    ERR("fcntl");
+
+flags &= ~O_NONBLOCK;            // usuń flagę
+
+if (fcntl(fd, F_SETFL, flags) == -1)
+    ERR("fcntl");
+
+
+
+
+    int flags = fcntl(fd, F_GETFL);
+
+if (flags == -1)
+    ERR("fcntl");
+
+if (flags & O_NONBLOCK)
+    printf("Tryb nieblokujacy\n");
+else
+    printf("Tryb blokujacy\n");
