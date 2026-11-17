@@ -297,3 +297,14 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+
+
+int digit = msg[i] - '0';
+
+if (step > 3 || (step == 3 && digit > 1))
+{
+    invalid_message(msg, len);
+    return;
+}
+
+step = step * 10 + digit;
