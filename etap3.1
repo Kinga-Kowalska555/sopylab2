@@ -1,0 +1,435 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <poll.h>
+
+#define ERR(source) (perror(source), exit(EXIT_FAILURE))
+
+#define RECIPE_SIZE 2048
+#define LINE_SIZE 64
+#define MAX_MESSAGE 127
+#define MAX_TOWERS 5
+
+// Osobny bufor dla kazdej babci
+typedef struct
+{
+    char message[MAX_MESSAGE];
+    size_t len;
+    int too_long;
+} MessageState;
+
+// Zapisuje wszystkie bajty
+void write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+        {
+            written += (size_t)n;
+        }
+        else if (n == -1 && errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+
+            ERR("write");
+        }
+    }
+}
+
+// ETAP 1: tworzenie lub otwieranie przepisu
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        char recipe[RECIPE_SIZE];
+
+        memset(recipe, ' ', sizeof(recipe));
+
+        for (int i = 63; i < RECIPE_SIZE; i += 64)
+            recipe[i] = '\n';
+
+        write_all(fd, recipe, sizeof(recipe));
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open recipe");
+
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open recipe");
+
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        const char msg[] = "Ta ksiega to nie przepis!\n";
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+
+        if (close(fd) == -1)
+            ERR("close");
+
+        exit(EXIT_FAILURE);
+    }
+
+    return fd;
+}
+
+// ETAP 2: komunikat o blednej wiadomosci
+void bad_message(const char *msg, size_t len, int too_long)
+{
+    const char prefix[] = "Babcia się zagadała: ";
+
+    write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    write_all(STDERR_FILENO, msg, len);
+
+    if (too_long)
+        write_all(STDERR_FILENO, "...", 3);
+
+    write_all(STDERR_FILENO, "\n", 1);
+}
+
+// ETAP 2: analiza kompletnej wiadomosci
+void process_message(int recipe_fd, const char *msg, size_t len)
+{
+    size_t pos = 0;
+    unsigned int step = 0;
+
+    // Wiadomosc musi zaczynac sie cyfra
+    if (len == 0 || msg[0] < '0' || msg[0] > '9')
+    {
+        bad_message(msg, len, 0);
+        return;
+    }
+
+    // Odczyt numeru kroku
+    while (pos < len && msg[pos] >= '0' && msg[pos] <= '9')
+    {
+        unsigned int digit = (unsigned int)(msg[pos] - '0');
+
+        if (step > 3 || (step == 3 && digit > 1))
+        {
+            bad_message(msg, len, 0);
+            return;
+        }
+
+        step = step * 10 + digit;
+        pos++;
+    }
+
+    // Po numerze musi byc dwukropek
+    if (pos >= len || msg[pos] != ':')
+    {
+        bad_message(msg, len, 0);
+        return;
+    }
+
+    pos++;
+
+    // Sprawdzenie ASCII
+    for (size_t i = pos; i < len; i++)
+    {
+        if ((unsigned char)msg[i] > 127)
+        {
+            bad_message(msg, len, 0);
+            return;
+        }
+    }
+
+    // Przygotowanie 64-bajtowej linii
+    char line[LINE_SIZE];
+
+    memset(line, ' ', sizeof(line));
+    line[63] = '\n';
+
+    size_t text_len = len - pos;
+
+    if (text_len > 63)
+        text_len = 63;
+
+    memcpy(line, msg + pos, text_len);
+
+    // Zapis do odpowiedniej linii przepisu
+    off_t offset = (off_t)step * LINE_SIZE;
+
+    if (lseek(recipe_fd, offset, SEEK_SET) == -1)
+        ERR("lseek");
+
+    write_all(recipe_fd, line, sizeof(line));
+
+    // Komunikat: Krok NN zapisany
+    char confirmation[] = "Krok 00 zapisany\n";
+
+    confirmation[5] = (char)('0' + step / 10);
+    confirmation[6] = (char)('0' + step % 10);
+
+    write_all(STDOUT_FILENO,
+              confirmation,
+              sizeof(confirmation) - 1);
+}
+
+// ETAP 3: dodaje odebrane bajty do bufora danej babci
+void handle_bytes(int recipe_fd, MessageState *state,
+                  const char *buf, size_t size)
+{
+    for (size_t i = 0; i < size; i++)
+    {
+        char c = buf[i];
+
+        if (c == '\n')
+        {
+            // Wiadomosc jest kompletna
+            if (state->too_long)
+                bad_message(state->message, state->len, 1);
+            else
+                process_message(recipe_fd,
+                                state->message,
+                                state->len);
+
+            // Zerujemy stan przed nastepna wiadomoscia
+            state->len = 0;
+            state->too_long = 0;
+        }
+        else
+        {
+            if (state->len < MAX_MESSAGE && !state->too_long)
+            {
+                state->message[state->len++] = c;
+            }
+            else
+            {
+                state->too_long = 1;
+            }
+        }
+    }
+}
+
+// ETAP 3: otwarcie FIFO
+int open_tower(const char *path)
+{
+    struct stat st;
+
+    if (stat(path, &st) == -1 || !S_ISFIFO(st.st_mode))
+    {
+        const char prefix[] = "Nie ma babci na wieży ";
+
+        write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+        write_all(STDERR_FILENO, path, strlen(path));
+        write_all(STDERR_FILENO, "\n", 1);
+
+        exit(EXIT_FAILURE);
+    }
+
+    // Blokujace open czeka na babcie uruchomiona
+    // w osobnym terminalu.
+    int fd = open(path, O_RDONLY);
+
+    if (fd == -1)
+        ERR("open FIFO");
+
+    // Sprawdzamy typ faktycznie otwartego obiektu
+    if (fstat(fd, &st) == -1)
+        ERR("fstat");
+
+    if (!S_ISFIFO(st.st_mode))
+    {
+        const char prefix[] = "Nie ma babci na wieży ";
+
+        write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+        write_all(STDERR_FILENO, path, strlen(path));
+        write_all(STDERR_FILENO, "\n", 1);
+
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Po otwarciu przestawiamy FIFO na O_NONBLOCK
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags == -1)
+        ERR("fcntl F_GETFL");
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+        ERR("fcntl F_SETFL");
+
+    return fd;
+}
+
+// ETAP 3: zamkniecie wiezy po EOF
+void finish_tower(struct pollfd *pfd, MessageState *state,
+                  const char *path)
+{
+    // Niedokonczona wiadomosc na koncu strumienia
+    if (state->len > 0 || state->too_long)
+        bad_message(state->message, state->len, state->too_long);
+
+    if (close(pfd->fd) == -1)
+        ERR("close FIFO");
+
+    // poll bedzie ignorowal ten element
+    pfd->fd = -1;
+    pfd->events = 0;
+    pfd->revents = 0;
+
+    const char prefix[] = "Babcia z wieży ";
+    const char suffix[] = " skończyła dyktować\n";
+
+    write_all(STDOUT_FILENO, prefix, sizeof(prefix) - 1);
+    write_all(STDOUT_FILENO, path, strlen(path));
+    write_all(STDOUT_FILENO, suffix, sizeof(suffix) - 1);
+}
+
+// ETAP 3: odczyt dostepnych danych z jednej wiezy
+// Zwraca 1, jesli wykryto EOF, w przeciwnym razie 0.
+int read_tower(int recipe_fd, struct pollfd *pfd,
+               MessageState *state, const char *path)
+{
+    char buf[256];
+
+    while (1)
+    {
+        ssize_t n = read(pfd->fd, buf, sizeof(buf));
+
+        if (n > 0)
+        {
+            handle_bytes(recipe_fd, state, buf, (size_t)n);
+        }
+        else if (n == 0)
+        {
+            finish_tower(pfd, state, path);
+            return 1;
+        }
+        else if (errno == EINTR)
+        {
+            continue;
+        }
+        else if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            return 0;
+        }
+        else
+        {
+            ERR("read FIFO");
+        }
+    }
+}
+
+int main(int argc, char **argv)
+{
+    // Program + recipe + od 1 do 5 wiez
+    if (argc < 3 || argc > 7)
+    {
+        const char usage[] =
+            "Uzycie: sop-cake recipe tower1 [tower2 ... tower5]\n";
+
+        write_all(STDERR_FILENO, usage, sizeof(usage) - 1);
+        return EXIT_FAILURE;
+    }
+
+    // ETAP 1: plik przepisu
+    int recipe_fd = open_recipe(argv[1]);
+
+    // Liczba wiez podanych w argumentach
+    int count = argc - 2;
+
+    struct pollfd fds[MAX_TOWERS];
+    MessageState states[MAX_TOWERS];
+
+    // Otwieramy wszystkie FIFO
+    for (int i = 0; i < count; i++)
+    {
+        fds[i].fd = open_tower(argv[i + 2]);
+        fds[i].events = POLLIN;
+        fds[i].revents = 0;
+
+        states[i].len = 0;
+        states[i].too_long = 0;
+    }
+
+    int active = count;
+
+    // ETAP 3: obslugujemy wszystkie babcie
+    while (active > 0)
+    {
+        int ret = poll(fds, (nfds_t)count, 3000);
+
+        if (ret == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            ERR("poll");
+        }
+
+        if (ret == 0)
+        {
+            const char msg[] = "Babcie dolewają herbatki…\n";
+
+            write_all(STDOUT_FILENO, msg, sizeof(msg) - 1);
+            continue;
+        }
+
+        // Sprawdzamy wszystkie wieze
+        for (int i = 0; i < count; i++)
+        {
+            if (fds[i].fd < 0)
+                continue;
+
+            short events = fds[i].revents;
+
+            // Nieprawidlowy deskryptor lub blad
+            if (events & (POLLNVAL | POLLERR))
+            {
+                const char msg[] = "Blad deskryptora FIFO\n";
+
+                write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+                exit(EXIT_FAILURE);
+            }
+
+            // POLLIN: sa dane
+            // POLLHUP: nadawca zamknal koniec FIFO.
+            // W obu sytuacjach probujemy czytac,
+            // zeby odebrac dane i wykryc EOF.
+            if (events & (POLLIN | POLLHUP))
+            {
+                int finished = read_tower(recipe_fd,
+                                          &fds[i],
+                                          &states[i],
+                                          argv[i + 2]);
+
+                if (finished)
+                    active--;
+            }
+        }
+    }
+
+    // Wszystkie babcie skonczyly
+    if (close(recipe_fd) == -1)
+        ERR("close recipe");
+
+    return EXIT_SUCCESS;
+}
