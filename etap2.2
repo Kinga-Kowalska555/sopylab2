@@ -1,0 +1,299 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define LINE_SIZE 64
+#define RECIPE_SIZE 2048
+#define MAX_MSG 127
+
+#define ERR(source) (perror(source), exit(EXIT_FAILURE))
+
+// ========================================
+// 1. Pelny zapis - z etapu 1
+// ========================================
+
+int write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+            written += (size_t)n;
+        else if (n == -1 && errno == EINTR)
+            continue;
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// ========================================
+// 2. Otwieranie przepisu - etap 1
+// ========================================
+
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        char recipe[RECIPE_SIZE];
+
+        memset(recipe, ' ', sizeof(recipe));
+
+        for (int i = LINE_SIZE - 1;
+             i < RECIPE_SIZE;
+             i += LINE_SIZE)
+        {
+            recipe[i] = '\n';
+        }
+
+        if (write_all(fd, recipe, sizeof(recipe)) == -1)
+            ERR("write recipe");
+
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open recipe");
+
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open recipe");
+
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        const char msg[] = "Ta ksiega to nie przepis!\n";
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+// ========================================
+// 3. Bledna wiadomosc
+// ========================================
+
+void invalid_message(const char *msg, size_t len)
+{
+    const char prefix[] = "Babcia się zagadała: ";
+
+    if (write_all(STDERR_FILENO, prefix,
+                  sizeof(prefix) - 1) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, msg, len) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, "\n", 1) == -1)
+        ERR("write stderr");
+}
+
+// ========================================
+// 4. Przetwarzanie kompletnej wiadomosci
+// ========================================
+
+void process_message(const char *msg, size_t len, int recipe_fd)
+{
+    size_t i = 0;
+    int step = 0;
+
+    // Odczytujemy cyfry przed dwukropkiem
+    while (i < len && msg[i] >= '0' && msg[i] <= '9')
+    {
+        step = step * 10 + (msg[i] - '0');
+
+        // Numer nie moze przekroczyc 31
+        if (step > 31)
+        {
+            invalid_message(msg, len);
+            return;
+        }
+
+        i++;
+    }
+
+    // Musi byc co najmniej jedna cyfra i dwukropek
+    if (i == 0 || i >= len || msg[i] != ':')
+    {
+        invalid_message(msg, len);
+        return;
+    }
+
+    // Tresc zaczyna sie za dwukropkiem
+    const char *content = msg + i + 1;
+    size_t content_len = len - i - 1;
+
+    if (content_len > 63)
+        content_len = 63;
+
+    // Budujemy linie przepisu
+    char line[LINE_SIZE];
+
+    memset(line, ' ', sizeof(line));
+    line[LINE_SIZE - 1] = '\n';
+
+    memcpy(line, content, content_len);
+
+    // Ustawiamy pozycje wybranego kroku
+    off_t offset = (off_t)step * LINE_SIZE;
+
+    if (lseek(recipe_fd, offset, SEEK_SET) == -1)
+        ERR("lseek");
+
+    // Zapisujemy cala linie
+    if (write_all(recipe_fd, line, sizeof(line)) == -1)
+        ERR("write recipe");
+
+    // Informacja o zapisanym kroku
+    char status[64];
+
+    int n = snprintf(status, sizeof(status),
+                     "Krok %02d zapisany\n", step);
+
+    if (n < 0 || (size_t)n >= sizeof(status))
+        ERR("snprintf");
+
+    if (write_all(STDOUT_FILENO, status, (size_t)n) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// 5. Czytanie FIFO i skladanie wiadomosci
+// ========================================
+
+void read_tower(int tower, int recipe_fd)
+{
+    char buffer[128];
+    char message[MAX_MSG];
+
+    size_t msg_len = 0;
+    int too_long = 0;
+
+    while (1)
+    {
+        ssize_t n = read(tower, buffer, sizeof(buffer));
+
+        if (n == 0)
+            break; // EOF
+
+        if (n == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            ERR("read tower");
+        }
+
+        for (ssize_t i = 0; i < n; i++)
+        {
+            if (buffer[i] == '\n')
+            {
+                if (too_long)
+                {
+                    const char text[] = "[za dluga wiadomosc]";
+                    invalid_message(text, sizeof(text) - 1);
+                }
+                else
+                {
+                    process_message(message, msg_len, recipe_fd);
+                }
+
+                msg_len = 0;
+                too_long = 0;
+            }
+            else if (!too_long)
+            {
+                if (msg_len < MAX_MSG)
+                {
+                    message[msg_len++] = buffer[i];
+                }
+                else
+                {
+                    // Pomijamy reszte az do '\n'
+                    too_long = 1;
+                }
+            }
+        }
+    }
+
+    // Niekompletna wiadomosc przy EOF
+    if (msg_len > 0 || too_long)
+    {
+        const char text[] = "[brak konca wiadomosci]";
+        invalid_message(text, sizeof(text) - 1);
+    }
+}
+
+// ========================================
+// 6. main
+// ========================================
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3 || argc > 7)
+    {
+        const char msg[] =
+            "Uzycie: sop-cake recipe tower1 [tower2 ... tower5]\n";
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return 1;
+    }
+
+    int recipe_fd = open_recipe(argv[1]);
+
+    if (recipe_fd == -1)
+        return 1;
+
+    struct stat st;
+
+    if (stat(argv[2], &st) == -1 || !S_ISFIFO(st.st_mode))
+    {
+        const char prefix[] = "Nie ma babci na wieży ";
+
+        write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+        write_all(STDERR_FILENO, argv[2], strlen(argv[2]));
+        write_all(STDERR_FILENO, "\n", 1);
+
+        close(recipe_fd);
+        return 1;
+    }
+
+    int tower = open(argv[2], O_RDONLY);
+
+    if (tower == -1)
+        ERR("open tower");
+
+    read_tower(tower, recipe_fd);
+
+    if (close(tower) == -1)
+        ERR("close tower");
+
+    if (close(recipe_fd) == -1)
+        ERR("close recipe");
+
+    return 0;
+}
