@@ -1,0 +1,712 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <poll.h>
+
+#define LINE_SIZE 64
+#define RECIPE_SIZE 2048
+#define MAX_MSG 127
+#define MAX_TOWERS 5
+#define BUF_SIZE 128
+
+#define ERR(source) (perror(source), exit(EXIT_FAILURE))
+
+// ========================================
+// FUNKCJA POMOCNICZA - PELNY ZAPIS
+// ========================================
+
+int write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+        {
+            written += (size_t)n;
+        }
+        else if (n == -1 && errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// Wypisanie napisu na stdout
+void print_stdout(const char *text)
+{
+    if (write_all(STDOUT_FILENO, text, strlen(text)) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// ETAP 1 - OTWIERANIE PRZEPISU
+// ========================================
+
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        // Nowy plik - tworzymy 2048 bajtow
+        char recipe[RECIPE_SIZE];
+
+        memset(recipe, ' ', sizeof(recipe));
+
+        // Co 64. bajt wstawiamy '\n'
+        for (int i = LINE_SIZE - 1;
+             i < RECIPE_SIZE;
+             i += LINE_SIZE)
+        {
+            recipe[i] = '\n';
+        }
+
+        if (write_all(fd, recipe, sizeof(recipe)) == -1)
+            ERR("write recipe");
+
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open recipe");
+
+    // Plik istnieje - otwieramy do odczytu i zapisu
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open recipe");
+
+    // Sprawdzamy rozmiar przez lseek
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        const char msg[] = "Ta ksiega to nie przepis!\n";
+
+        if (write_all(STDERR_FILENO, msg,
+                      sizeof(msg) - 1) == -1)
+            ERR("write stderr");
+
+        if (close(fd) == -1)
+            ERR("close recipe");
+
+        return -1;
+    }
+
+    return fd;
+}
+
+// ========================================
+// ETAP 2 - BLEDNA WIADOMOSC
+// ========================================
+
+void invalid_message(const char *msg, size_t len)
+{
+    const char prefix[] = "Babcia się zagadała: ";
+
+    if (write_all(STDERR_FILENO, prefix,
+                  sizeof(prefix) - 1) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, msg, len) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, "\n", 1) == -1)
+        ERR("write stderr");
+}
+
+// ========================================
+// ETAP 2 - PRZETWARZANIE WIADOMOSCI
+// ========================================
+
+void process_message(const char *msg, size_t len, int recipe_fd)
+{
+    size_t i = 0;
+    int step = 0;
+
+    // Odczytujemy cyfry przed dwukropkiem
+    while (i < len && msg[i] >= '0' && msg[i] <= '9')
+    {
+        int digit = msg[i] - '0';
+
+        // Sprawdzamy zakres 0-31 przed mnozeniem
+        if (step > 3 || (step == 3 && digit > 1))
+        {
+            invalid_message(msg, len);
+            return;
+        }
+
+        step = step * 10 + digit;
+        i++;
+    }
+
+    // Musi byc co najmniej jedna cyfra i dwukropek
+    if (i == 0 || i >= len || msg[i] != ':')
+    {
+        invalid_message(msg, len);
+        return;
+    }
+
+    // Tresc zaczyna sie za dwukropkiem
+    const char *content = msg + i + 1;
+    size_t content_len = len - i - 1;
+
+    // Obcinamy tresc do 63 bajtow
+    if (content_len > LINE_SIZE - 1)
+        content_len = LINE_SIZE - 1;
+
+    // Budujemy linie przepisu
+    char line[LINE_SIZE];
+
+    memset(line, ' ', sizeof(line));
+    line[LINE_SIZE - 1] = '\n';
+
+    // Kopiujemy sama tresc
+    memcpy(line, content, content_len);
+
+    // Ustawiamy pozycje odpowiedniego kroku
+    off_t offset = (off_t)step * LINE_SIZE;
+
+    if (lseek(recipe_fd, offset, SEEK_SET) == -1)
+        ERR("lseek");
+
+    // Zapisujemy dokladnie 64 bajty
+    if (write_all(recipe_fd, line, sizeof(line)) == -1)
+        ERR("write recipe");
+
+    // Komunikat o zapisaniu kroku
+    char status[64];
+
+    int n = snprintf(status, sizeof(status),
+                     "Krok %02d zapisany\n", step);
+
+    if (n < 0 || (size_t)n >= sizeof(status))
+    {
+        errno = EIO;
+        ERR("snprintf");
+    }
+
+    if (write_all(STDOUT_FILENO, status, (size_t)n) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// ETAP 3 - STRUKTURA JEDNEJ WIEZY
+// ========================================
+
+typedef struct
+{
+    const char *path;
+
+    // Niedokonczona wiadomosc konkretnej babci
+    char message[MAX_MSG];
+
+    size_t msg_len;
+    int too_long;
+
+} TowerState;
+
+// ========================================
+// ETAP 3 - PRZETWARZANIE FRAGMENTU FIFO
+// ========================================
+
+void process_chunk(TowerState *tower,
+                   const char *buf,
+                   ssize_t n,
+                   int recipe_fd)
+{
+    for (ssize_t i = 0; i < n; i++)
+    {
+        char c = buf[i];
+
+        if (c == '\n')
+        {
+            // Kompletna wiadomosc
+            if (tower->too_long)
+            {
+                const char text[] = "[za dluga wiadomosc]";
+
+                invalid_message(text, sizeof(text) - 1);
+            }
+            else
+            {
+                process_message(tower->message,
+                                tower->msg_len,
+                                recipe_fd);
+            }
+
+            // Reset przed nastepna wiadomoscia
+            tower->msg_len = 0;
+            tower->too_long = 0;
+        }
+        else if (!tower->too_long)
+        {
+            if (tower->msg_len < MAX_MSG)
+            {
+                tower->message[tower->msg_len++] = c;
+            }
+            else
+            {
+                // Pomijamy reszte az do '\n'
+                tower->too_long = 1;
+            }
+        }
+    }
+}
+
+// ========================================
+// ETAP 3 - ZAKONCZENIE JEDNEJ WIEZY
+// ========================================
+
+void finish_tower(struct pollfd *pfd, TowerState *tower)
+{
+    // Niedokonczona wiadomosc przy EOF
+    if (tower->msg_len > 0 || tower->too_long)
+    {
+        const char text[] = "[brak konca wiadomosci]";
+
+        invalid_message(text, sizeof(text) - 1);
+    }
+
+    // Zamykamy deskryptor FIFO
+    if (close(pfd->fd) == -1)
+        ERR("close tower");
+
+    // poll ignoruje deskryptory ujemne
+    pfd->fd = -1;
+
+    const char prefix[] = "Babcia z wieży ";
+    const char suffix[] = " skończyła dyktować\n";
+
+    if (write_all(STDOUT_FILENO, prefix,
+                  sizeof(prefix) - 1) == -1)
+        ERR("write stdout");
+
+    if (write_all(STDOUT_FILENO, tower->path,
+                  strlen(tower->path)) == -1)
+        ERR("write stdout");
+
+    if (write_all(STDOUT_FILENO, suffix,
+                  sizeof(suffix) - 1) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// ETAP 3 - USTAWIENIE O_NONBLOCK
+// ========================================
+
+void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags == -1)
+        ERR("fcntl F_GETFL");
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+        ERR("fcntl F_SETFL");
+}
+
+// ========================================
+// ETAP 3 - ODCZYT WIELU WIEZ PRZEZ POLL
+// ========================================
+
+void read_towers(struct pollfd fds[],
+                 TowerState towers[],
+                 int count,
+                 int recipe_fd)
+{
+    int active = count;
+
+    char buffer[BUF_SIZE];
+
+    // Dopoki jakas babcia jeszcze dyktuje
+    while (active > 0)
+    {
+        // Czekamy maksymalnie 3 sekundy
+        int ready = poll(fds, (nfds_t)count, 3000);
+
+        if (ready == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            ERR("poll");
+        }
+
+        // Timeout - brak zdarzen
+        if (ready == 0)
+        {
+            print_stdout("Babcie dolewają herbatki…\n");
+            continue;
+        }
+
+        // Sprawdzamy wszystkie wieze
+        for (int i = 0; i < count; i++)
+        {
+            // Wieza juz zamknieta
+            if (fds[i].fd == -1)
+                continue;
+
+            short events = fds[i].revents;
+
+            if (events & POLLNVAL)
+            {
+                errno = EBADF;
+                ERR("poll invalid fd");
+            }
+
+            if (events & POLLERR)
+            {
+                errno = EIO;
+                ERR("poll tower error");
+            }
+
+            // Mozliwy odczyt lub rozlaczenie
+            if (events & (POLLIN | POLLHUP))
+            {
+                ssize_t n = read(fds[i].fd,
+                                 buffer,
+                                 sizeof(buffer));
+
+                if (n > 0)
+                {
+                    // Przetwarzamy fragment danej wiezy
+                    process_chunk(&towers[i],
+                                  buffer,
+                                  n,
+                                  recipe_fd);
+                }
+                else if (n == 0)
+                {
+                    // EOF - ta babcia skonczyla
+                    finish_tower(&fds[i], &towers[i]);
+
+                    active--;
+                }
+                else if (errno == EINTR ||
+                         errno == EAGAIN ||
+                         errno == EWOULDBLOCK)
+                {
+                    // Pozniej wrocimy do poll()
+                    continue;
+                }
+                else
+                {
+                    ERR("read tower");
+                }
+            }
+        }
+    }
+}
+
+// ================================================
+// ================================================
+// ETAP 4 - MMAP I KONCOWE PRZETWARZANIE PRZEPISU
+// ================================================
+// ================================================
+
+void finish_recipe(int recipe_fd)
+{
+    // ========================================
+    // ETAP 4A - MAPOWANIE PLIKU DO PAMIECI
+    // ========================================
+
+    char *data = mmap(NULL,
+                      RECIPE_SIZE,
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED,
+                      recipe_fd,
+                      0);
+
+    if (data == MAP_FAILED)
+        ERR("mmap");
+
+    // ========================================
+    // ETAP 4B - ZAMIANA raw~berries
+    // ========================================
+
+    const char old_text[] = "raw~berries";
+    const char new_text[] = "raspberries";
+
+    const size_t word_len = sizeof(old_text) - 1;
+
+    int replaced = 0;
+
+    // Przechodzimy po wszystkich 32 liniach
+    for (int step = 0;
+         step < RECIPE_SIZE / LINE_SIZE;
+         step++)
+    {
+        char *line = data + step * LINE_SIZE;
+
+        // Przeszukujemy 63 bajty tresci
+        // Nie wchodzimy w koncowy '\n'
+        for (size_t j = 0;
+             j + word_len <= LINE_SIZE - 1;)
+        {
+            if (memcmp(line + j, old_text, word_len) == 0)
+            {
+                // Podmieniamy bajty bez zmiany dlugosci
+                memcpy(line + j, new_text, word_len);
+
+                replaced++;
+
+                // Przeskakujemy zamieniony napis
+                j += word_len;
+            }
+            else
+            {
+                j++;
+            }
+        }
+    }
+
+    // ========================================
+    // ETAP 4C - WYPISANIE LICZBY ZAMIAN
+    // ========================================
+
+    char status[128];
+
+    int n = snprintf(status,
+                     sizeof(status),
+                     "Brudy księżniczki Joanny wyczyszczone: %d\n",
+                     replaced);
+
+    if (n < 0 || (size_t)n >= sizeof(status))
+    {
+        errno = EIO;
+        ERR("snprintf");
+    }
+
+    if (write_all(STDOUT_FILENO, status, (size_t)n) == -1)
+        ERR("write stdout");
+
+    // ========================================
+    // ETAP 4D - WYPISANIE NIEPUSTYCH KROKOW
+    // ========================================
+
+    int missing = 0;
+
+    for (int step = 0;
+         step < RECIPE_SIZE / LINE_SIZE;
+         step++)
+    {
+        const char *line = data + step * LINE_SIZE;
+
+        // Maksymalnie 63 bajty bez '\n'
+        size_t len = LINE_SIZE - 1;
+
+        // Usuwamy spacje z konca wypisywanej tresci
+        while (len > 0 && line[len - 1] == ' ')
+        {
+            len--;
+        }
+
+        // Pusta linia - same spacje
+        if (len == 0)
+        {
+            missing++;
+            continue;
+        }
+
+        // Numer kroku zawsze dwucyfrowy
+        char prefix[8];
+
+        int prefix_len = snprintf(prefix,
+                                  sizeof(prefix),
+                                  "%02d: ",
+                                  step);
+
+        if (prefix_len < 0 ||
+            (size_t)prefix_len >= sizeof(prefix))
+        {
+            errno = EIO;
+            ERR("snprintf");
+        }
+
+        // Wypisujemy NN:
+        if (write_all(STDOUT_FILENO,
+                      prefix,
+                      (size_t)prefix_len) == -1)
+            ERR("write stdout");
+
+        // Wypisujemy tresc bez koncowych spacji
+        if (write_all(STDOUT_FILENO, line, len) == -1)
+            ERR("write stdout");
+
+        // Koniec wyswietlanej linii
+        if (write_all(STDOUT_FILENO, "\n", 1) == -1)
+            ERR("write stdout");
+    }
+
+    // ========================================
+    // ETAP 4E - INFORMACJA O BRAKUJACYCH
+    // ========================================
+
+    if (missing > 0)
+    {
+        n = snprintf(status,
+                     sizeof(status),
+                     "Brakuje %d kroków, tort sie zapadnie!\n",
+                     missing);
+
+        if (n < 0 || (size_t)n >= sizeof(status))
+        {
+            errno = EIO;
+            ERR("snprintf");
+        }
+
+        if (write_all(STDOUT_FILENO,
+                      status,
+                      (size_t)n) == -1)
+            ERR("write stdout");
+    }
+    else
+    {
+        print_stdout("Tort gotowy!\n");
+    }
+
+    // ========================================
+    // ETAP 4F - ZAPIS ZMIAN I MUNMAP
+    // ========================================
+
+    // Synchronizujemy zmiany z plikiem
+    if (msync(data, RECIPE_SIZE, MS_SYNC) == -1)
+        ERR("msync");
+
+    // Zwalniamy mapowanie pamieci
+    if (munmap(data, RECIPE_SIZE) == -1)
+        ERR("munmap");
+}
+
+// ========================================
+// MAIN - WSZYSTKIE ETAPY 1, 2, 3, 4
+// ========================================
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3 || argc > MAX_TOWERS + 2)
+    {
+        const char msg[] =
+            "Uzycie: sop-cake recipe tower1 [tower2 ... tower5]\n";
+
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return EXIT_FAILURE;
+    }
+
+    // ========================================
+    // ETAP 1 - PRZYGOTOWANIE PRZEPISU
+    // ========================================
+
+    int recipe_fd = open_recipe(argv[1]);
+
+    if (recipe_fd == -1)
+        return EXIT_FAILURE;
+
+    int count = argc - 2;
+
+    // ========================================
+    // ETAP 3 - TABLICE DLA WSZYSTKICH WIEZ
+    // ========================================
+
+    struct pollfd fds[MAX_TOWERS];
+    TowerState towers[MAX_TOWERS] = {0};
+
+    // Sprawdzamy, czy wszystkie wieze sa FIFO
+    for (int i = 0; i < count; i++)
+    {
+        const char *path = argv[i + 2];
+        struct stat st;
+
+        if (stat(path, &st) == -1 ||
+            !S_ISFIFO(st.st_mode))
+        {
+            const char prefix[] = "Nie ma babci na wieży ";
+
+            if (write_all(STDERR_FILENO,
+                          prefix,
+                          sizeof(prefix) - 1) == -1)
+                ERR("write stderr");
+
+            if (write_all(STDERR_FILENO,
+                          path,
+                          strlen(path)) == -1)
+                ERR("write stderr");
+
+            if (write_all(STDERR_FILENO, "\n", 1) == -1)
+                ERR("write stderr");
+
+            if (close(recipe_fd) == -1)
+                ERR("close recipe");
+
+            return EXIT_FAILURE;
+        }
+    }
+
+    // ========================================
+    // ETAP 3 - OTWIERANIE WIEZ
+    // ========================================
+
+    for (int i = 0; i < count; i++)
+    {
+        int fd = open(argv[i + 2], O_RDONLY);
+
+        if (fd == -1)
+            ERR("open tower");
+
+        // Nieblokujacy odczyt po otwarciu
+        set_nonblocking(fd);
+
+        fds[i].fd = fd;
+        fds[i].events = POLLIN;
+        fds[i].revents = 0;
+
+        towers[i].path = argv[i + 2];
+    }
+
+    // ========================================
+    // ETAPY 2-3 - ODBIERANIE WIADOMOSCI
+    // ========================================
+
+    read_towers(fds, towers, count, recipe_fd);
+
+    // ========================================
+    // ETAP 4 - MMAP I PODSUMOWANIE
+    // ========================================
+
+    // Tutaj trafiamy dopiero po EOF wszystkich FIFO
+    finish_recipe(recipe_fd);
+
+    // ========================================
+    // KONCOWE SPRZATANIE
+    // ========================================
+
+    if (close(recipe_fd) == -1)
+        ERR("close recipe");
+
+    return EXIT_SUCCESS;
+}
