@@ -1,0 +1,554 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <poll.h>
+#include <stdint.h>
+
+#define LINE_SIZE 64
+#define RECIPE_SIZE 2048
+#define READ_BUF_SIZE 256
+
+#define ERR(source) (perror(source), exit(EXIT_FAILURE))
+
+// ========================================
+// 1. Pelny zapis - bez zmian
+// ========================================
+
+int write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+            written += (size_t)n;
+        else if (n == -1 && errno == EINTR)
+            continue;
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// ========================================
+// 2. Otwieranie przepisu - dynamiczny bufor
+// ========================================
+
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        // Dynamiczna alokacja 2048 bajtow
+        char *recipe = malloc(RECIPE_SIZE);
+
+        if (recipe == NULL)
+            ERR("malloc recipe");
+
+        memset(recipe, ' ', RECIPE_SIZE);
+
+        for (size_t i = LINE_SIZE - 1;
+             i < RECIPE_SIZE;
+             i += LINE_SIZE)
+        {
+            recipe[i] = '\n';
+        }
+
+        if (write_all(fd, recipe, RECIPE_SIZE) == -1)
+            ERR("write recipe");
+
+        // Pamięć nie jest juz potrzebna
+        free(recipe);
+
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open recipe");
+
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open recipe");
+
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        const char msg[] = "Ta ksiega to nie przepis!\n";
+
+        if (write_all(STDERR_FILENO, msg,
+                      sizeof(msg) - 1) == -1)
+            ERR("write stderr");
+
+        if (close(fd) == -1)
+            ERR("close recipe");
+
+        return -1;
+    }
+
+    return fd;
+}
+
+// ========================================
+// 3. Bledna wiadomosc - bez zmian
+// ========================================
+
+void invalid_message(const char *msg, size_t len)
+{
+    const char prefix[] = "Babcia się zagadała: ";
+
+    if (write_all(STDERR_FILENO, prefix,
+                  sizeof(prefix) - 1) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, msg, len) == -1)
+        ERR("write stderr");
+
+    if (write_all(STDERR_FILENO, "\n", 1) == -1)
+        ERR("write stderr");
+}
+
+// ========================================
+// 4. Przetwarzanie kompletnej wiadomosci
+// ========================================
+
+// line to dynamiczny bufor przydzielony w main()
+
+void process_message(const char *msg, size_t len,
+                     int recipe_fd, char *line)
+{
+    size_t i = 0;
+    int step = 0;
+
+    // Odczyt numeru przed dwukropkiem
+    while (i < len && msg[i] >= '0' && msg[i] <= '9')
+    {
+        int digit = msg[i] - '0';
+
+        if (step > 3 || (step == 3 && digit > 1))
+        {
+            invalid_message(msg, len);
+            return;
+        }
+
+        step = step * 10 + digit;
+        i++;
+    }
+
+    // Co najmniej jedna cyfra i dwukropek
+    if (i == 0 || i >= len || msg[i] != ':')
+    {
+        invalid_message(msg, len);
+        return;
+    }
+
+    // Tresc za dwukropkiem
+    const char *content = msg + i + 1;
+    size_t content_len = len - i - 1;
+
+    if (content_len > LINE_SIZE - 1)
+        content_len = LINE_SIZE - 1;
+
+    // Wypelniamy dynamiczny bufor linii
+    memset(line, ' ', LINE_SIZE);
+    line[LINE_SIZE - 1] = '\n';
+
+    memcpy(line, content, content_len);
+
+    // Ustawiamy pozycje zapisu
+    off_t offset = (off_t)step * LINE_SIZE;
+
+    if (lseek(recipe_fd, offset, SEEK_SET) == -1)
+        ERR("lseek");
+
+    if (write_all(recipe_fd, line, LINE_SIZE) == -1)
+        ERR("write recipe");
+
+    // Komunikat o zapisanym kroku
+    char status[64];
+
+    int n = snprintf(status, sizeof(status),
+                     "Krok %02d zapisany\n", step);
+
+    if (n < 0 || (size_t)n >= sizeof(status))
+        ERR("snprintf");
+
+    if (write_all(STDOUT_FILENO, status, (size_t)n) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// 5. Dynamiczna struktura jednej wiezy
+// ========================================
+
+typedef struct
+{
+    const char *path;
+
+    // Dynamiczny bufor wiadomosci
+    char *message;
+
+    // Aktualna dlugosc wiadomosci
+    size_t msg_len;
+
+    // Aktualna pojemnosc bufora
+    size_t capacity;
+
+} TowerState;
+
+// ========================================
+// 6. Dynamiczne powiekszanie wiadomosci
+// ========================================
+
+void append_char(TowerState *tower, char c)
+{
+    // Brakuje miejsca na kolejny bajt
+    if (tower->msg_len == tower->capacity)
+    {
+        size_t new_capacity;
+
+        if (tower->capacity == 0)
+        {
+            // Pierwsza alokacja
+            new_capacity = 64;
+        }
+        else
+        {
+            // Powiekszamy dwukrotnie
+            if (tower->capacity > SIZE_MAX / 2)
+            {
+                errno = ENOMEM;
+                ERR("message too large");
+            }
+
+            new_capacity = tower->capacity * 2;
+        }
+
+        char *tmp = realloc(tower->message, new_capacity);
+
+        if (tmp == NULL)
+            ERR("realloc message");
+
+        tower->message = tmp;
+        tower->capacity = new_capacity;
+    }
+
+    tower->message[tower->msg_len++] = c;
+}
+
+// ========================================
+// 7. Przetwarzanie fragmentu FIFO
+// ========================================
+
+void process_chunk(TowerState *tower,
+                   const char *buf,
+                   ssize_t n,
+                   int recipe_fd,
+                   char *line)
+{
+    for (ssize_t i = 0; i < n; i++)
+    {
+        char c = buf[i];
+
+        if (c == '\n')
+        {
+            // Kompletna wiadomosc
+            process_message(tower->message,
+                            tower->msg_len,
+                            recipe_fd,
+                            line);
+
+            // Reset dlugosci
+            // Nie zwalniamy jeszcze bufora!
+            tower->msg_len = 0;
+        }
+        else
+        {
+            // Dopisujemy bajt do dynamicznej tablicy
+            append_char(tower, c);
+        }
+    }
+}
+
+// ========================================
+// 8. Zakonczenie jednej wiezy
+// ========================================
+
+void finish_tower(struct pollfd *pfd,
+                  TowerState *tower)
+{
+    // Niekompletna wiadomosc przy EOF
+    if (tower->msg_len > 0)
+    {
+        invalid_message(tower->message,
+                        tower->msg_len);
+    }
+
+    if (close(pfd->fd) == -1)
+        ERR("close tower");
+
+    // poll ignoruje ujemne deskryptory
+    pfd->fd = -1;
+
+    // Zwalniamy dynamiczny bufor
+    free(tower->message);
+
+    tower->message = NULL;
+    tower->msg_len = 0;
+    tower->capacity = 0;
+
+    const char prefix[] = "Babcia z wieży ";
+    const char suffix[] = " skończyła dyktować\n";
+
+    if (write_all(STDOUT_FILENO, prefix,
+                  sizeof(prefix) - 1) == -1)
+        ERR("write stdout");
+
+    if (write_all(STDOUT_FILENO, tower->path,
+                  strlen(tower->path)) == -1)
+        ERR("write stdout");
+
+    if (write_all(STDOUT_FILENO, suffix,
+                  sizeof(suffix) - 1) == -1)
+        ERR("write stdout");
+}
+
+// ========================================
+// 9. Ustawienie trybu nieblokujacego
+// ========================================
+
+void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags == -1)
+        ERR("fcntl GETFL");
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+        ERR("fcntl SETFL");
+}
+
+// ========================================
+// 10. Obsluga wielu wiez przez poll()
+// ========================================
+
+void read_towers(struct pollfd *fds,
+                 TowerState *towers,
+                 int count,
+                 int recipe_fd,
+                 char *line)
+{
+    int active = count;
+
+    // Dynamiczny bufor odczytu
+    char *buffer = malloc(READ_BUF_SIZE);
+
+    if (buffer == NULL)
+        ERR("malloc read buffer");
+
+    while (active > 0)
+    {
+        int ready = poll(fds, (nfds_t)count, 3000);
+
+        if (ready == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            ERR("poll");
+        }
+
+        // Timeout po 3 sekundach
+        if (ready == 0)
+        {
+            const char msg[] =
+                "Babcie dolewają herbatki…\n";
+
+            if (write_all(STDOUT_FILENO, msg,
+                          sizeof(msg) - 1) == -1)
+                ERR("write stdout");
+
+            continue;
+        }
+
+        // Obslugujemy gotowe FIFO
+        for (int i = 0; i < count; i++)
+        {
+            if (fds[i].fd == -1)
+                continue;
+
+            short events = fds[i].revents;
+
+            if (events & POLLNVAL)
+            {
+                errno = EBADF;
+                ERR("poll invalid fd");
+            }
+
+            if (events & POLLERR)
+            {
+                errno = EIO;
+                ERR("poll tower");
+            }
+
+            if (events & (POLLIN | POLLHUP))
+            {
+                ssize_t n = read(fds[i].fd,
+                                 buffer,
+                                 READ_BUF_SIZE);
+
+                if (n > 0)
+                {
+                    process_chunk(&towers[i],
+                                  buffer,
+                                  n,
+                                  recipe_fd,
+                                  line);
+                }
+                else if (n == 0)
+                {
+                    // EOF danej wiezy
+                    finish_tower(&fds[i], &towers[i]);
+                    active--;
+                }
+                else if (errno == EINTR ||
+                         errno == EAGAIN ||
+                         errno == EWOULDBLOCK)
+                {
+                    continue;
+                }
+                else
+                {
+                    ERR("read tower");
+                }
+            }
+        }
+    }
+
+    // Koniec - zwalniamy bufor odczytu
+    free(buffer);
+}
+
+// ========================================
+// 11. MAIN - wszystkie tablice dynamiczne
+// ========================================
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3)
+    {
+        const char msg[] =
+            "Uzycie: sop-cake recipe tower1 [tower2 ...]\n";
+
+        write_all(STDERR_FILENO, msg,
+                  sizeof(msg) - 1);
+
+        return EXIT_FAILURE;
+    }
+
+    // Otwieramy lub tworzymy przepis
+    int recipe_fd = open_recipe(argv[1]);
+
+    if (recipe_fd == -1)
+        return EXIT_FAILURE;
+
+    // Dowolna liczba wiez z argumentow
+    int count = argc - 2;
+
+    // Dynamiczne tablice
+    struct pollfd *fds = calloc(count, sizeof(*fds));
+    TowerState *towers = calloc(count, sizeof(*towers));
+
+    if (fds == NULL || towers == NULL)
+        ERR("calloc towers");
+
+    // Dynamiczna linia przepisu
+    char *line = malloc(LINE_SIZE);
+
+    if (line == NULL)
+        ERR("malloc line");
+
+    // Inicjalizacja deskryptorow
+    for (int i = 0; i < count; i++)
+    {
+        fds[i].fd = -1;
+        fds[i].events = POLLIN;
+        fds[i].revents = 0;
+    }
+
+    // Sprawdzamy wszystkie FIFO
+    for (int i = 0; i < count; i++)
+    {
+        const char *path = argv[i + 2];
+        struct stat st;
+
+        if (stat(path, &st) == -1 ||
+            !S_ISFIFO(st.st_mode))
+        {
+            const char prefix[] = "Nie ma babci na wieży ";
+
+            write_all(STDERR_FILENO, prefix,
+                      sizeof(prefix) - 1);
+
+            write_all(STDERR_FILENO, path,
+                      strlen(path));
+
+            write_all(STDERR_FILENO, "\n", 1);
+
+            free(line);
+            free(fds);
+            free(towers);
+            close(recipe_fd);
+
+            return EXIT_FAILURE;
+        }
+    }
+
+    // Otwieramy wszystkie wieze
+    for (int i = 0; i < count; i++)
+    {
+        int fd = open(argv[i + 2], O_RDONLY);
+
+        if (fd == -1)
+            ERR("open tower");
+
+        set_nonblocking(fd);
+
+        fds[i].fd = fd;
+        towers[i].path = argv[i + 2];
+    }
+
+    // Obslugujemy FIFO za pomoca poll()
+    read_towers(fds, towers, count, recipe_fd, line);
+
+    if (close(recipe_fd) == -1)
+        ERR("close recipe");
+
+    // Zwolnienie wszystkich tablic
+    free(line);
+    free(fds);
+    free(towers);
+
+    return EXIT_SUCCESS;
+}
