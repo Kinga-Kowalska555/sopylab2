@@ -1,0 +1,288 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#define ERR(source) \
+    (perror(source), exit(EXIT_FAILURE))
+
+#define RECIPE_SIZE 2048
+#define LINE_SIZE 64
+#define MAX_MESSAGE 127
+
+// Zapisuje wszystkie bajty, nawet przy czesciowym write()
+void write_all(int fd, const void *buf, size_t size)
+{
+    const char *p = buf;
+    size_t written = 0;
+
+    while (written < size)
+    {
+        ssize_t n = write(fd, p + written, size - written);
+
+        if (n > 0)
+        {
+            written += (size_t)n;
+        }
+        else if (n == -1 && errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            if (n == 0)
+                errno = EIO;
+            ERR("write");
+        }
+    }
+}
+
+// Otwiera istniejacy przepis albo tworzy nowy
+int open_recipe(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+    if (fd >= 0)
+    {
+        char recipe[RECIPE_SIZE];
+
+        memset(recipe, ' ', sizeof(recipe));
+
+        // Koniec kazdej linii to '\n'
+        for (int i = 63; i < RECIPE_SIZE; i += 64)
+            recipe[i] = '\n';
+
+        write_all(fd, recipe, sizeof(recipe));
+        return fd;
+    }
+
+    if (errno != EEXIST)
+        ERR("open recipe");
+
+    // Plik juz istnieje
+    fd = open(path, O_RDWR);
+
+    if (fd == -1)
+        ERR("open recipe");
+
+    off_t size = lseek(fd, 0, SEEK_END);
+
+    if (size == -1)
+        ERR("lseek");
+
+    if (size != RECIPE_SIZE)
+    {
+        const char msg[] = "Ta ksiega to nie przepis!\n";
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    return fd;
+}
+
+// Informacja o niepoprawnej wiadomosci
+void bad_message(const char *msg, size_t len, int too_long)
+{
+    const char prefix[] = "Babcia się zagadała: ";
+    write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+
+    write_all(STDERR_FILENO, msg, len);
+
+    if (too_long)
+    {
+        const char suffix[] = "...";
+        write_all(STDERR_FILENO, suffix, sizeof(suffix) - 1);
+    }
+
+    write_all(STDERR_FILENO, "\n", 1);
+}
+
+// Analizuje jedna KOMPLETNA wiadomosc (bez '\n')
+void process_message(int recipe_fd, const char *msg, size_t len)
+{
+    size_t pos = 0;
+    unsigned int step = 0;
+
+    // Numer musi zaczynac sie od cyfry
+    if (len == 0 || msg[0] < '0' || msg[0] > '9')
+    {
+        bad_message(msg, len, 0);
+        return;
+    }
+
+    // Odczytujemy cyfry przed dwukropkiem
+    while (pos < len && msg[pos] >= '0' && msg[pos] <= '9')
+    {
+        unsigned int digit = (unsigned int)(msg[pos] - '0');
+
+        // Nie dopuszczamy do przekroczenia zakresu 0..31
+        if (step > 3 || (step == 3 && digit > 1))
+        {
+            bad_message(msg, len, 0);
+            return;
+        }
+
+        step = step * 10 + digit;
+        pos++;
+    }
+
+    // Po numerze musi byc dwukropek
+    if (pos >= len || msg[pos] != ':')
+    {
+        bad_message(msg, len, 0);
+        return;
+    }
+
+    pos++; // Pomijamy ':'
+
+    // Sprawdzamy, czy tresc jest ASCII
+    for (size_t i = pos; i < len; i++)
+    {
+        if ((unsigned char)msg[i] > 127)
+        {
+            bad_message(msg, len, 0);
+            return;
+        }
+    }
+
+    // Tworzymy pojedyncza linie przepisu
+    char line[LINE_SIZE];
+
+    memset(line, ' ', sizeof(line));
+    line[63] = '\n';
+
+    // Sama tresc, bez numeru i dwukropka
+    size_t text_len = len - pos;
+
+    if (text_len > 63)
+        text_len = 63;
+
+    memcpy(line, msg + pos, text_len);
+
+    // Ustawiamy pozycje odpowiedniej linii
+    off_t offset = (off_t)step * LINE_SIZE;
+
+    if (lseek(recipe_fd, offset, SEEK_SET) == -1)
+        ERR("lseek");
+
+    // Nadpisujemy dokladnie 64 bajty
+    write_all(recipe_fd, line, sizeof(line));
+
+    // Komunikat: Krok NN zapisany
+    char confirmation[] = "Krok 00 zapisany\n";
+
+    confirmation[5] = (char)('0' + step / 10);
+    confirmation[6] = (char)('0' + step % 10);
+
+    write_all(STDOUT_FILENO,
+              confirmation,
+              sizeof(confirmation) - 1);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3)
+    {
+        const char msg[] = "Uzycie: sop-cake recipe tower1\n";
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return EXIT_FAILURE;
+    }
+
+    // ETAP 1: przygotowanie przepisu
+    int recipe_fd = open_recipe(argv[1]);
+
+    // Sprawdzamy, czy tower1 jest FIFO
+    struct stat st;
+
+    if (stat(argv[2], &st) == -1 || !S_ISFIFO(st.st_mode))
+    {
+        const char prefix[] = "Nie ma babci na wieży ";
+        write_all(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+        write_all(STDERR_FILENO, argv[2], strlen(argv[2]));
+        write_all(STDERR_FILENO, "\n", 1);
+
+        if (close(recipe_fd) == -1)
+            ERR("close");
+        return EXIT_FAILURE;
+    }
+
+    int fifo_fd = open(argv[2], O_RDONLY);
+
+    if (fifo_fd == -1)
+        ERR("open FIFO");
+
+    // ETAP 2: skladanie wiadomosci z fragmentow
+    char read_buf[256];
+
+    char message[MAX_MESSAGE];
+    size_t msg_len = 0;
+    int too_long = 0;
+
+    while (1)
+    {
+        ssize_t n = read(fifo_fd, read_buf, sizeof(read_buf));
+
+        if (n == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            ERR("read");
+        }
+
+        if (n == 0)
+            break; // EOF - babcia skonczyla
+
+        // Przechodzimy po kazdym odebranym bajcie
+        for (ssize_t i = 0; i < n; i++)
+        {
+            char c = read_buf[i];
+
+            if (c == '\n')
+            {
+                // Mamy cala wiadomosc
+                if (too_long)
+                    bad_message(message, msg_len, 1);
+                else
+                    process_message(recipe_fd, message, msg_len);
+
+                // Przygotowanie do nastepnej wiadomosci
+                msg_len = 0;
+                too_long = 0;
+            }
+            else
+            {
+                if (msg_len < MAX_MESSAGE && !too_long)
+                {
+                    message[msg_len++] = c;
+                }
+                else
+                {
+                    // Wiadomosc przekroczyla 127 bajtow
+                    // Pomijamy dalsze bajty az do '\n'
+                    too_long = 1;
+                }
+            }
+        }
+    }
+
+    // Niekompletna wiadomosc na koncu strumienia
+    if (msg_len > 0 || too_long)
+        bad_message(message, msg_len, too_long);
+
+    if (close(fifo_fd) == -1)
+        ERR("close");
+
+    if (close(recipe_fd) == -1)
+        ERR("close");
+
+    return EXIT_SUCCESS;
+}
